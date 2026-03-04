@@ -33,7 +33,7 @@ Algorithme TypeScript de planification automatique d'analyses de laboratoire. Il
 ## Structure du projet
 
 ```
-lab-scheduler/
+planifyLab/
 ├── src/
 │   ├── types/
 │   │   ├── enums.ts          # SampleType, Priority, SpecialityType
@@ -65,7 +65,7 @@ lab-scheduler/
 
 ```bash
 git clone https://github.com/loxfer72/planifyLab.git
-cd lab-scheduler
+cd planifyLab
 npm install
 ```
 
