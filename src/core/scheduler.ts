@@ -1,141 +1,294 @@
-import { Sample, ScheduleEntry, SchedulerInput, SchedulerOutput } from "../types";
-import { timeToMinutes, minutesToTime, isCompatible } from "./utils";
+import {
+  Sample, Technician, Equipment,
+  SchedulerInput, SchedulerOutput, ScheduleEntry, Metrics, LunchState,
+  WaitingTimeByPriority,
+} from "../types";
+import {
+  timeToMinutes, minutesToTime, adjustedDuration,
+  isCompatibleV2, getEquipmentUsageAt,
+} from "./utils";
+import {
+  isEquipmentAvailableForWindow, getAvailableAfterMaintenance,
+} from "./maintenance";
+import {
+  initLunchStates, adjustForLunch, interruptLunchForStat,
+} from "./lunch";
+import { resolveAnalysisType } from "./analysisMapping";
 
-// Map de priorité pour le tri
 const PRIORITY_ORDER: Record<string, number> = {
-  STAT: 0,
-  URGENT: 1,
-  ROUTINE: 2,
+  STAT: 0, URGENT: 1, ROUTINE: 2,
 };
 
-/**
- * Trie les samples par priorité décroissante (STAT en premier)
- */
-function sortByPriority(samples: Sample[]): Sample[] {
-  return [...samples].sort(
-    (a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]
-  );
+// ─── Tri ──────────────────────────────────────────────────────────────────────
+
+function sortSamples(samples: Sample[]): Sample[] {
+  return [...samples].sort((a, b) => {
+    const pDiff = PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority];
+    if (pDiff !== 0) return pDiff;
+    // À priorité égale → heure d'arrivée croissante
+    return timeToMinutes(a.arrivalTime) - timeToMinutes(b.arrivalTime);
+  });
 }
 
-/**
- * Trouve le créneau le plus tôt possible pour une paire (tech, equipment)
- */
-function findEarliestSlot(
+// ─── Calcul du créneau ────────────────────────────────────────────────────────
+
+function computeStartTime(
   sample: Sample,
+  tech: Technician,
+  equip: Equipment,
   techFreeAt: number,
   equipFreeAt: number,
-  techStartTime: number
+  lunchState: LunchState,
+  duration: number,
+  currentSchedule: ScheduleEntry[]
 ): number {
-  return Math.max(
+  // 1. Earliest possible = max de toutes les contraintes de base
+  let start = Math.max(
     timeToMinutes(sample.arrivalTime),
+    timeToMinutes(tech.startTime),
     techFreeAt,
     equipFreeAt,
-    techStartTime
   );
+
+  // 2. Contrainte maintenance équipement
+  start = getAvailableAfterMaintenance(equip, start);
+
+  // Si l'analyse chevauche encore la maintenance après décalage → avancer après
+  while (!isEquipmentAvailableForWindow(equip, start, start + duration)) {
+    start = timeToMinutes(equip.maintenanceWindow.end);
+  }
+
+  // 3. Contrainte pause déjeuner (sauf STAT qui peut interrompre)
+  if (sample.priority !== "STAT") {
+    start = adjustForLunch(lunchState, start, duration);
+  }
+
+  // 4. Capacité équipement : si plein, décaler à la fin de la première analyse libérée
+  let attempts = 0;
+  while (
+    getEquipmentUsageAt(equip.id, start, currentSchedule) >= equip.capacity
+    && attempts < 100
+  ) {
+    start++;
+    attempts++;
+  }
+
+  // 5. Nettoyage : ajouter cleaningTime après la dernière analyse sur cet équipement
+  const lastEquipEnd = currentSchedule
+    .filter((e) => e.equipmentId === equip.id)
+    .map((e) => timeToMinutes(e.endTime))
+    .sort((a, b) => b - a)[0];
+
+  if (lastEquipEnd !== undefined && start < lastEquipEnd + equip.cleaningTime) {
+    const cleanedStart = lastEquipEnd + equip.cleaningTime;
+    start = Math.max(start, cleanedStart);
+  }
+
+  return start;
 }
 
-/**
- * Calcule les métriques finales du planning
- */
+// ─── Métriques ────────────────────────────────────────────────────────────────
+
 function computeMetrics(
   schedule: ScheduleEntry[],
-  totalAnalysisTime: number,
-  conflicts: number
-): SchedulerOutput["metrics"] {
+  technicians: Technician[],
+  conflicts: number,
+  lunchInterruptions: number,
+  samples: Sample[]
+): Metrics {
   if (schedule.length === 0) {
-    return { totalTime: 0, efficiency: 0, conflicts };
+    const empty: WaitingTimeByPriority = { STAT: 0, URGENT: 0, ROUTINE: 0 };
+    return { totalTime: 0, efficiency: 0, conflicts, averageWaitingTime: empty,
+             technicianUtilization: {}, parallelismRate: 0, lunchInterruptions };
   }
 
   const allStarts = schedule.map((e) => timeToMinutes(e.startTime));
-  const allEnds = schedule.map((e) => timeToMinutes(e.endTime));
+  const allEnds   = schedule.map((e) => timeToMinutes(e.endTime));
+  const planStart = Math.min(...allStarts);
+  const planEnd   = Math.max(...allEnds);
+  const totalTime = planEnd - planStart;
 
-  const totalTime = Math.max(...allEnds) - Math.min(...allStarts);
+  // Efficacité officielle : Σ(occupation_technicien) / nb_tech / totalTime * 100
+  const techOccupation: Record<string, number> = {};
+  for (const entry of schedule) {
+    const dur = timeToMinutes(entry.endTime) - timeToMinutes(entry.startTime);
+    techOccupation[entry.technicianId] = (techOccupation[entry.technicianId] ?? 0) + dur;
+  }
+
+  const sumOccupation = Object.values(techOccupation).reduce((a, b) => a + b, 0);
   const efficiency = totalTime > 0
-    ? Math.round((totalAnalysisTime / totalTime) * 1000) / 10  // 1 décimale --- à noté que le cachier des charges sembles inverser totalAnalysisTime et totalTime dans son calcul
+    ? Math.round((sumOccupation / technicians.length / totalTime) * 1000) / 10
     : 0;
 
-  return { totalTime, efficiency, conflicts };
+  // Utilisation par technicien
+  const technicianUtilization: Record<string, number> = {};
+  for (const tech of technicians) {
+    const occ = techOccupation[tech.id] ?? 0;
+    technicianUtilization[tech.id] = totalTime > 0
+      ? Math.round((occ / totalTime) * 1000) / 10
+      : 0;
+  }
+
+  // Temps d'attente moyen par priorité
+  const waitByPriority: Record<string, number[]> = { STAT: [], URGENT: [], ROUTINE: [] };
+  for (const entry of schedule) {
+    const sample = samples.find((s) => s.id === entry.sampleId);
+    if (!sample) continue;
+    const wait = timeToMinutes(entry.startTime) - timeToMinutes(sample.arrivalTime);
+    waitByPriority[entry.priority].push(Math.max(0, wait));
+  }
+
+  const avg = (arr: number[]) =>
+    arr.length > 0 ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
+
+  const averageWaitingTime = {
+    STAT:    avg(waitByPriority.STAT),
+    URGENT:  avg(waitByPriority.URGENT),
+    ROUTINE: avg(waitByPriority.ROUTINE),
+  };
+
+  // Taux de parallélisme : % des minutes où ≥2 analyses tournent simultanément
+  let parallelMinutes = 0;
+  for (let t = planStart; t < planEnd; t++) {
+    const active = schedule.filter((e) => {
+      const s = timeToMinutes(e.startTime);
+      const end = timeToMinutes(e.endTime);
+      return t >= s && t < end;
+    }).length;
+    if (active >= 2) parallelMinutes++;
+  }
+  const parallelismRate = totalTime > 0
+    ? Math.round((parallelMinutes / totalTime) * 1000) / 10
+    : 0;
+
+  return {
+    totalTime, efficiency, conflicts,
+    averageWaitingTime, technicianUtilization,
+    parallelismRate, lunchInterruptions,
+  };
 }
 
-/**
- * Algorithme principal de scheduling
- * Stratégie greedy : pour chaque sample (trié par priorité),
- * on choisit la paire (tech, equipment) qui libère le créneau le plus tôt
- */
+// ─── Algorithme principal ─────────────────────────────────────────────────────
+
 export function schedule(input: SchedulerInput): SchedulerOutput {
   const { samples, technicians, equipment } = input;
 
-  const sortedSamples = sortByPriority(samples);
+  const sorted = sortSamples(samples);
 
-  // Tracker la disponibilité de chaque ressource (en minutes depuis minuit)
-  const techFreeAt = new Map<string, number>(
+  // Trackers de disponibilité
+  const techFreeAt  = new Map<string, number>(
     technicians.map((t) => [t.id, timeToMinutes(t.startTime)])
   );
-  const equipFreeAt = new Map<string, number>(
-    equipment.map((e) => [e.id, 0])
-  );
+const equipFreeAt = new Map<string, number>(
+  equipment.map((e) => [
+    e.id,
+    e.maintenanceWindow ? timeToMinutes(e.maintenanceWindow.end) : 0,
+  ])
+);
 
+  const lunchStates = initLunchStates(technicians);
   const result: ScheduleEntry[] = [];
-  let totalAnalysisTime = 0;
-  let conflicts = 0;
+  let conflicts         = 0;
+  let lunchInterruptions = 0;
 
-  for (const sample of sortedSamples) {
-    let bestSlot: number = Infinity;
-    let bestTech = null;
-    let bestEquip = null;
+  for (const sample of sorted) {
+    let bestStart  = Infinity;
+    let bestTech: Technician | null  = null;
+    let bestEquip: Equipment | null  = null;
+    let bestDuration = 0;
 
-    // Cherche la meilleure paire compatible
-    for (const tech of technicians) {
-      for (const equip of equipment) {
-        if (!equip.available) continue; // à changer lors de l'ajout de la fonction de maintenance
-        if (!isCompatible(sample, tech, equip)) continue;
+    // First-fit parmi toutes les paires compatibles
+for (const tech of technicians) {
+  for (const equip of equipment) {
+    // 🔍 DEBUG TEMPORAIRE
+    const resolved = resolveAnalysisType(sample.analysisType);
+    console.log(`[DEBUG] Sample ${sample.id} | analysisType raw: "${sample.analysisType}" | resolved: ${resolved}`);
+    console.log(`[DEBUG] Tech ${tech.id} | specialty: ${JSON.stringify(tech.specialty)}`);
+    console.log(`[DEBUG] Equip ${equip.id} | type: ${equip.type}`);
+    console.log(`[DEBUG] techOk: ${resolved && tech.specialty.includes(resolved)} | equipOk: ${resolved === equip.type}`);
+    console.log("---");
+    // 🔍 FIN DEBUG
 
-        const slot = findEarliestSlot(
-          sample,
-          techFreeAt.get(tech.id) ?? 0,
-          equipFreeAt.get(equip.id) ?? 0,
-          timeToMinutes(tech.startTime)
+    if (!isCompatibleV2(sample, tech, equip)) continue;
+
+// 🔍 DEBUG
+console.log(`[DEBUG] Paire compatible trouvée : ${tech.id} + ${equip.id}, calcul du slot...`);
+try {
+  const duration = adjustedDuration(sample.analysisTime, tech.efficiency);
+  const lunchState = lunchStates.get(tech.id)!;
+  console.log(`[DEBUG] duration: ${duration} | lunchState: ${JSON.stringify(lunchState)}`);
+  const start = computeStartTime(sample, tech, equip, techFreeAt.get(tech.id)!, equipFreeAt.get(equip.id)!, lunchState, duration, result);
+  console.log(`[DEBUG] start calculé: ${start}`);
+} catch (e) {
+  console.error(`[DEBUG] ERREUR dans computeStartTime:`, e);
+}
+
+        const duration = adjustedDuration(sample.analysisTime, tech.efficiency);
+        const lunchState = lunchStates.get(tech.id)!;
+
+        const start = computeStartTime(
+          sample, tech, equip,
+          techFreeAt.get(tech.id)!,
+          equipFreeAt.get(equip.id)!,
+          lunchState,
+          duration,
+          result
         );
 
-        // Greedy : on prend la paire qui commence le plus tôt
-        if (slot < bestSlot) {
-          bestSlot = slot;
-          bestTech = tech;
-          bestEquip = equip;
+        // Greedy first-fit : prendre la première paire qui commence le plus tôt
+        if (start < bestStart) {
+          bestStart    = start;
+          bestTech     = tech;
+          bestEquip    = equip;
+          bestDuration = duration;
         }
       }
     }
 
     if (!bestTech || !bestEquip) {
-      // Aucune ressource compatible trouvée → conflit
       conflicts++;
       continue;
     }
 
-    const endMinutes = bestSlot + sample.analysisTime;
+    const lunchState = lunchStates.get(bestTech.id)!;
+
+    // Gestion interruption STAT pendant pause déjeuner
+    let wasStatInterrupt = false;
+    if (sample.priority === "STAT" && lunchState.remainingMinutes > 0) {
+      const lunchStart = lunchState.plannedStart;
+      const lunchEnd   = lunchState.plannedEnd;
+      // Le technicien est en pause et le STAT arrive pendant
+      if (bestStart >= lunchStart && bestStart < lunchEnd) {
+        interruptLunchForStat(lunchState, bestStart, bestDuration);
+        wasStatInterrupt = true;
+        lunchInterruptions++;
+      }
+    }
+
+    const endMinutes = bestStart + bestDuration;
 
     result.push({
-      sampleId: sample.id,
-      technicianId: bestTech.id,
-      equipmentId: bestEquip.id,
-      startTime: minutesToTime(bestSlot),
-      endTime: minutesToTime(endMinutes),
-      priority: sample.priority,
+      sampleId:        sample.id,
+      technicianId:    bestTech.id,
+      equipmentId:     bestEquip.id,
+      startTime:       minutesToTime(bestStart),
+      endTime:         minutesToTime(endMinutes),
+      priority:        sample.priority,
+      adjustedDuration: bestDuration,
+      wasStatInterrupt,
     });
 
-    // Mise à jour des disponibilités
+    // Mise à jour disponibilités
+    // Équipement : libéré après analyse + nettoyage
     techFreeAt.set(bestTech.id, endMinutes);
-    equipFreeAt.set(bestEquip.id, endMinutes);
-    totalAnalysisTime += sample.analysisTime;
+    equipFreeAt.set(bestEquip.id, endMinutes + bestEquip.cleaningTime);
   }
 
-  // Tri chronologique final du planning
-  result.sort(
-    (a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime)
-  );
+  // Tri chronologique final
+  result.sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
 
   return {
     schedule: result,
-    metrics: computeMetrics(result, totalAnalysisTime, conflicts),
+    metrics: computeMetrics(result, technicians, conflicts, lunchInterruptions, samples),
   };
 }

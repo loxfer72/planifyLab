@@ -1,54 +1,44 @@
 {
   "samples": [
     {
-      "id": "S001", 
+      "id": "S001",
+      "priority": "ROUTINE",
       "type": "BLOOD",
-      "priority": "URGENT",
-      "analysisTime": 60,
-      "arrivalTime": "09:00", 
-      "patientId": "P001"
+      "analysisType": "Bilan lipidique",
+      "analysisTime": 30,
+      "arrivalTime": "09:00"
     },
     {
       "id": "S002",
-      "type": "URINE", 
       "priority": "URGENT",
-      "analysisTime": 30,
-      "arrivalTime": "09:15",
-      "patientId": "P002" 
-    },
-    {
-      "id": "S003",
       "type": "BLOOD",
-      "priority": "ROUTINE", 
+      "analysisType": "Numération complète",
       "analysisTime": 45,
-      "arrivalTime": "09:00",
-      "patientId": "P003"
+      "arrivalTime": "09:15"
     }
   ],
   "technicians": [
     {
-      "id": "T001",
-      "speciality": "BLOOD",
-      "startTime": "08:00", 
-      "endTime": "17:00"
-    },
-    {
-      "id": "T002", 
-      "speciality": "GENERAL",
+      "id": "TECH001",
+      "specialty": ["BLOOD", "CHEMISTRY"],
+      "efficiency": 1.0,
       "startTime": "08:00",
-      "endTime": "17:00"
+      "endTime": "17:00",
+      "lunchBreak": "12:00-13:00"
     }
   ],
   "equipment": [
     {
-      "id": "E001",
+      "id": "EQ001",
       "type": "BLOOD",
-      "available": true
+      "capacity": 1,
+      "cleaningTime": 10
     },
     {
-      "id": "E002", 
-      "type": "URINE",
-      "available": true
+      "id": "EQ002",
+      "type": "CHEMISTRY",
+      "capacity": 1,
+      "cleaningTime": 15
     }
   ]
 }
